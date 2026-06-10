@@ -1,0 +1,10 @@
+# VPN Config (sensible)
+vpn-config/credentials.txt
+vpn-config/*.ovpn
+
+# Logs
+*.log
+/tmp/
+
+# System
+.DS_Store

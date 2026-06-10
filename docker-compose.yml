@@ -1,0 +1,37 @@
+services:
+  # Le tunnel VPN isolé
+  vpn:
+    image: dperson/openvpn-client
+    container_name: vpn_namecheap
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "3456:3456"
+    volumes:
+      - ./vpn-config:/vpn
+    command: -f config.ovpn
+    restart: unless-stopped
+
+  # OpenCode utilise la stack réseau du VPN
+  opencode:
+    image: nezhar/opencode-cli:latest
+    container_name: opencode_app
+    user: root
+    network_mode: "service:vpn"
+    volumes:
+      - .:/workspace
+      - /root/.config/opencode:/config
+      - /root/.local/share/opencode:/data
+      - /root/everything-claude-code:/root/everything-claude-code
+    environment:
+      - HOME=/config
+      - OPENCODE_CONFIG_DIR=/config
+      - USER_UID=0
+      - USER_GID=0
+    stdin_open: true
+    tty: true
+    depends_on:
+      vpn:
+        condition: service_healthy

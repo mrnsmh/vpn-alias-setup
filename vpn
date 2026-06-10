@@ -1,0 +1,150 @@
+#!/bin/bash
+# VPN manager — tunnel OpenCode via le réseau VPN
+VPN_DIR="/root/opencode-vpn"
+VPN_CFG_DIR="/root/vpn-config/serverListUDP"
+VPN_CFG="$VPN_DIR/vpn-config/config.ovpn"
+
+usage() {
+  echo "Usage: vpn <cmd> [args]"
+  echo "  status              Statut + IP"
+  echo "  list                Serveurs dispo"
+  echo "  change <lieu>       Changer de serveur"
+  echo "  opencode [projet]   OpenCode sous VPN"
+  echo "  hermes [projet]     Hermes Agent sous VPN"
+  echo "  openclaw [projet]   OpenClaw sous VPN"
+  echo "  oc-go-cc            Proxy OC-GO-CC sous VPN (nsenter)"
+  echo "  stop                Arrêter le VPN"
+}
+
+apply_patches() {
+  local f="$1"
+  sed -i 's/^auth-user-pass$/auth-user-pass credentials.txt/' "$f"
+  sed -i '/^data-ciphers /d; /^data-ciphers-fallback /d' "$f"
+  grep -q '^cipher ' "$f" || echo "cipher AES-256-CBC" >> "$f"
+}
+
+vpn_list() {
+  ls "$VPN_CFG_DIR" | sed 's/^NCVPN-//;s/-UDP\.ovpn$//;s/ - / /g;s/  / /g' | sort
+}
+
+vpn_status() {
+  docker ps -q --filter name=vpn_namecheap >/dev/null 2>&1 || { echo "VPN: arrêté"; return; }
+  echo "VPN: $(docker ps --filter name=vpn_namecheap --format '{{.Status}}')"
+  local ip=$(docker exec vpn_namecheap curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null)
+  echo "IP:  $ip"
+}
+
+vpn_change() {
+  local s="$1"; [ -z "$s" ] && vpn_list && read -p "Serveur: " s
+  local sn=$(echo "$s" | tr '-' ' ' | tr '[:upper:]' '[:lower:]')
+  local m=$(ls "$VPN_CFG_DIR" | grep -iv "virtual" | while read f; do
+    local fn=$(echo "$f" | sed 's/^NCVPN-//;s/-UDP\.ovpn$//' | tr '-' ' ' | tr '[:upper:]' '[:lower:]')
+    echo "$fn|$f"
+  done | grep -i "$sn" | head -1 | cut -d'|' -f2)
+  [ -z "$m" ] && echo "Aucun serveur pour '$s'" && vpn_list && return 1
+
+  local d=$(echo "$m" | sed 's/^NCVPN-//;s/-UDP\.ovpn$//;s/ - / /g;s/  / /g')
+  echo "→ $d"
+  cp "$VPN_CFG_DIR/$m" "$VPN_CFG"; apply_patches "$VPN_CFG"
+  docker stop vpn_namecheap 2>/dev/null; docker rm vpn_namecheap 2>/dev/null
+  docker run -d --rm --cap-add NET_ADMIN --device /dev/net/tun:/dev/net/tun \
+    --name vpn_namecheap -p 3456:3456 -v "$VPN_DIR/vpn-config:/vpn" \
+    dperson/openvpn-client -f config.ovpn >/dev/null 2>&1
+  echo "Connexion..."
+  for i in $(seq 1 15); do
+    docker ps --filter name=vpn_namecheap --format '{{.Status}}' 2>/dev/null | grep -q healthy && break
+    sleep 2
+  done
+  vpn_status
+}
+
+vpn_nsenter_run() {
+  local cmd="$1" label="$2" wd="$3"
+  docker ps -q --filter name=vpn_namecheap >/dev/null 2>&1 || {
+    echo "Démarrage VPN..." && vpn_change "${4:-new-york}" 2>/dev/null || return 1
+  }
+
+  local ip=$(docker exec vpn_namecheap curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null)
+  echo "VPN: $ip"
+  [ -n "$label" ] && echo "$label"
+  [ -n "$wd" ] && [ "$wd" != "/root" ] && echo "Projet: $(basename "$wd")"
+
+  local pid=$(docker inspect vpn_namecheap -f '{{.State.Pid}}')
+
+  nsenter -t "$pid" -n -- unshare -m sh -c "
+    echo 'nameserver 1.1.1.1' > /tmp/resolv.conf
+    mount --bind /tmp/resolv.conf /etc/resolv.conf
+    $( [ -n "$wd" ] && echo "cd '$wd' &&" ) exec $cmd
+  "
+}
+
+vpn_opencode() {
+  local p="$1"; local wd="/root"
+  [ -n "$p" ] && [ ! -d "$p" ] && [ -d "/root/$p" ] && p="/root/$p"
+  [ -n "$p" ] && [ -d "$p" ] && wd="$p"
+  vpn_nsenter_run "opencode" "" "$wd" "$2"
+}
+
+vpn_hermes() {
+  local p="$1"; local wd="/root"
+  [ -n "$p" ] && [ ! -d "$p" ] && [ -d "/root/$p" ] && p="/root/$p"
+  [ -n "$p" ] && [ -d "$p" ] && wd="$p"
+  vpn_nsenter_run "hermes" "Hermes Agent" "$wd" "$2"
+}
+
+vpn_openclaw() {
+  local p="$1"; local wd="/root"
+  [ -n "$p" ] && [ ! -d "$p" ] && [ -d "/root/$p" ] && p="/root/$p"
+  [ -n "$p" ] && [ -d "$p" ] && wd="$p"
+  vpn_nsenter_run "openclaw" "OpenClaw" "$wd" "$2"
+}
+
+vpn_oc_go_cc() {
+  local server="${1:-new-york}"
+  local vpn_started=false
+
+  cleanup() {
+    if [ "$vpn_started" = true ]; then
+      echo "Arrêt VPN..."
+      docker stop vpn_namecheap 2>/dev/null
+      docker rm vpn_namecheap 2>/dev/null
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if [ -z "$(docker ps -q --filter name=vpn_namecheap 2>/dev/null)" ]; then
+    echo "Démarrage VPN..."
+    vpn_change "$server" || return 1
+    vpn_started=true
+  else
+    for i in $(seq 1 10); do
+      docker ps --filter name=vpn_namecheap --format '{{.Status}}' 2>/dev/null | grep -q healthy && break
+      sleep 1
+    done
+  fi
+
+  local ip=$(docker exec vpn_namecheap curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null)
+  [ -z "$ip" ] && { echo "VPN pas prêt"; return 1; }
+  echo "VPN: $ip"
+  echo "oc-go-cc: proxy serveur (Ctrl+C pour arrêter)"
+
+  local pid=$(docker inspect vpn_namecheap -f '{{.State.Pid}}')
+
+  nsenter -t "$pid" -n -- unshare -m sh -c "
+    echo 'nameserver 1.1.1.1' > /tmp/resolv.conf
+    mount --bind /tmp/resolv.conf /etc/resolv.conf
+    exec /usr/local/bin/oc-go-cc serve
+  "
+}
+
+case "${1:-}" in
+  opencode|run)   vpn_opencode "$2" "$3" ;;
+  hermes)         vpn_hermes "$2" "$3" ;;
+  openclaw)       vpn_openclaw "$2" "$3" ;;
+  oc-go-cc)       vpn_oc_go_cc "$2" "$3" ;;
+  change|switch)  vpn_change "$2" ;;
+  list|ls)        vpn_list ;;
+  status|ip)      vpn_status ;;
+  stop)           docker stop vpn_namecheap 2>/dev/null && echo "VPN arrêté" ;;
+  *)              usage ;;
+esac
